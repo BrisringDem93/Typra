@@ -43,6 +43,7 @@ class AudioMeter(QWidget):
         self._peak: float = 0.0
         self._peak_hold: int = 0  # Remaining ticks before peak decays
         self._active: bool = False  # Dims the meter when not recording
+        self._threshold: float = 0.0  # silence threshold mark (0 = none)
 
         # Decay timer
         self._timer = QTimer(self)
@@ -60,6 +61,11 @@ class AudioMeter(QWidget):
     def set_level(self, rms: float) -> None:
         """Thread-safe: emit signal so the update happens in the UI thread."""
         self.level_changed.emit(float(rms))
+
+    def set_threshold(self, level: float) -> None:
+        """Draw a mark where sound stops counting as silence (0..1)."""
+        self._threshold = min(1.0, max(0.0, level))
+        self.update()
 
     def set_active(self, active: bool) -> None:
         self._active = active
@@ -132,6 +138,13 @@ class AudioMeter(QWidget):
             pen.setWidth(2)
             painter.setPen(pen)
             painter.drawLine(px, 1, px, h - 1)
+
+        # Silence threshold: a dashed mark
+        if self._threshold > 0:
+            tx = int(w * self._threshold)
+            pen = QPen(QColor(255, 255, 255, 150), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(tx, 0, tx, h)
 
         # Border
         painter.setPen(QPen(self._COLOR_BORDER, 1))

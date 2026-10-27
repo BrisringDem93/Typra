@@ -156,6 +156,10 @@ LangString PyStartFailed ${LANG_ENGLISH} "The Python installer could not be star
 LangString PyStartFailed ${LANG_ITALIAN} "Non è stato possibile avviare l'installer di Python (potrebbe essere stato bloccato da un criterio o dall'antivirus)."
 LangString RunningElevated ${LANG_ENGLISH} "Setup is running as administrator, which it does not need. Typra would be installed for the administrator account and would not be started at the end.$\r$\n$\r$\nTo install it for your own account, click Cancel and run Setup normally."
 LangString RunningElevated ${LANG_ITALIAN} "L'installazione è in esecuzione come amministratore, cosa che non serve. Typra verrebbe installato per l'account amministratore e non verrebbe avviato alla fine.$\r$\n$\r$\nPer installarlo nel tuo account, fai clic su Annulla ed esegui l'installazione normalmente."
+LangString DetailGpu ${LANG_ENGLISH} "Reinstalling GPU support (NVIDIA cuBLAS, about 630 MB)..."
+LangString DetailGpu ${LANG_ITALIAN} "Reinstallazione del supporto GPU (NVIDIA cuBLAS, circa 630 MB)..."
+LangString GpuNotKept ${LANG_ENGLISH} "GPU support could not be reinstalled, so Typra will use the CPU for now. Install it again from Settings > Advanced > Install GPU support."
+LangString GpuNotKept ${LANG_ITALIAN} "Non è stato possibile reinstallare il supporto GPU, quindi per ora Typra userà la CPU. Reinstallalo da Impostazioni > Advanced > Install GPU support."
 LangString LlamaRemoved ${LANG_ENGLISH} "The optional llama-cpp-python package (AI Cleanup) is not part of the new installation. If you use AI Cleanup, install it again as described in the README."
 LangString LlamaRemoved ${LANG_ITALIAN} "Il pacchetto opzionale llama-cpp-python (AI Cleanup) non fa parte della nuova installazione. Se usi AI Cleanup, installalo di nuovo come descritto nel README."
 LangString DirNotEmpty ${LANG_ENGLISH} "The selected folder is not empty and does not contain a previous Typra installation.$\r$\n$\r$\nPlease choose an empty or new folder."
@@ -214,6 +218,8 @@ Function ${UN}RemoveAppCode
   Delete "$INSTDIR\download_models.py"
   Delete "$INSTDIR\requirements.txt"
   Delete "$INSTDIR\requirements.lock"
+  Delete "$INSTDIR\requirements-gpu.txt"
+  Delete "$INSTDIR\requirements-gpu.lock"
   Delete "$INSTDIR\setup.bat"
   Delete "$INSTDIR\run.bat"
   Delete "$INSTDIR\typra.ico"
@@ -560,8 +566,14 @@ Section "$(SecCoreName)" SecCore
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File "${SRC}\requirements.lock"
+  File "${SRC}\requirements-gpu.lock"
   SetOutPath "$INSTDIR"
   StrCpy $5 0
+  StrCpy $6 0
+  StrCpy $7 0
+  ${If} ${FileExists} "$INSTDIR\.venv\Lib\site-packages\nvidia\cublas\bin\cublas64_12.dll"
+    StrCpy $6 1   ; GPU support installed from Settings: keep it
+  ${EndIf}
   ${If} ${FileExists} "$INSTDIR\.venv\Lib\site-packages\llama_cpp\*.*"
     StrCpy $5 1   ; optional AI Cleanup package, installed by hand
   ${EndIf}
@@ -595,6 +607,19 @@ Section "$(SecCoreName)" SecCore
     SetErrorLevel 2
     Abort
   ${EndIf}
+  ; GPU support is optional: if it cannot be reinstalled, Typra uses the CPU
+  ${If} $6 == 1
+    DetailPrint "$(DetailGpu)"
+    nsExec::ExecToLog '"$INSTDIR\.venv.new\Scripts\python.exe" -I -m pip install --use-feature=truststore --disable-pip-version-check --no-input --require-hashes --only-binary=:all: -r "$PLUGINSDIR\requirements-gpu.lock"'
+    Pop $0
+    ${If} $0 != 0
+      nsExec::ExecToLog '"$INSTDIR\.venv.new\Scripts\python.exe" -I -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: -r "$PLUGINSDIR\requirements-gpu.lock"'
+      Pop $0
+    ${EndIf}
+    ${If} $0 != 0
+      StrCpy $7 1
+    ${EndIf}
+  ${EndIf}
 
   ; 3. Application files
   SetOutPath "$INSTDIR"
@@ -603,6 +628,8 @@ Section "$(SecCoreName)" SecCore
   File "${SRC}\download_models.py"
   File "${SRC}\requirements.txt"
   File "${SRC}\requirements.lock"
+  File "${SRC}\requirements-gpu.txt"
+  File "${SRC}\requirements-gpu.lock"
   File "${SRC}\setup.bat"
   File "${SRC}\run.bat"
   File "${SRC}\typra.ico"
@@ -647,6 +674,9 @@ Section "$(SecCoreName)" SecCore
   CreateShortcut "$SMPROGRAMS\${APPNAME}.lnk" "$INSTDIR\.venv\Scripts\pythonw.exe" '-E "$INSTDIR\main.py"' "$INSTDIR\typra.ico" 0
   ${If} $5 == 1
     MessageBox MB_ICONINFORMATION "$(LlamaRemoved)" /SD IDOK
+  ${EndIf}
+  ${If} $7 == 1
+    MessageBox MB_ICONEXCLAMATION "$(GpuNotKept)" /SD IDOK
   ${EndIf}
 
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2

@@ -13,7 +13,13 @@ DEFAULTS: dict = {
     "recording_mode":     "toggle",      # toggle only
 
     # ── Audio / transcription ──────────────────────────────────────────
-    "chunk_seconds":      3.0,
+    # live: text is typed while you speak, phrase by phrase
+    # complete: the whole dictation is transcribed at once when you stop
+    "dictation_mode":     "live",
+    # complete mode: "panel" shows the text in the result panel,
+    # "insert" types it into the window where dictation started
+    "complete_output":    "panel",
+    "live_max_seconds":   12.0,          # longest phrase in live mode
     "silence_threshold":  0.008,
     "silence_seconds":    0.7,
     "sample_rate":        16000,
@@ -48,9 +54,17 @@ HALLUCINATION_PHRASES = {
 }
 
 
+_CHOICES: dict[str, set] = {
+    "dictation_mode":  {"live", "complete"},
+    "complete_output": {"panel", "insert"},
+}
+
+
 def _valid(key: str, value) -> bool:
     """A saved value must have the type of its default (ints are fine for
     floats), so a hand-edited or corrupted file cannot crash the app later."""
+    if key in _CHOICES:
+        return value in _CHOICES[key]
     default = DEFAULTS[key]
     if isinstance(default, bool):
         return isinstance(value, bool)
@@ -123,7 +137,12 @@ class Settings:
     @property
     def microphone_name(self) -> str: return self._data.get("microphone_name", "")
     @property
-    def chunk_seconds(self) -> float: return float(self._data["chunk_seconds"])
+    def dictation_mode(self) -> str:  return self._data["dictation_mode"]
+    @property
+    def complete_output(self) -> str: return self._data["complete_output"]
+    @property
+    def live_max_seconds(self) -> float:
+        return min(30.0, max(3.0, float(self._data["live_max_seconds"])))
     @property
     def silence_threshold(self) -> float: return float(self._data["silence_threshold"])
     @property

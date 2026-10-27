@@ -62,7 +62,8 @@ class AudioRecorder:
         try:
             hostapi = sd.default.hostapi
             for idx, dev in enumerate(sd.query_devices()):
-                if dev["max_input_channels"] > 0:
+                # The "Sound Mapper" is the Windows default, listed separately
+                if dev["max_input_channels"] > 0 and "Sound Mapper" not in dev["name"]:
                     mic = MicrophoneInfo(
                         index=idx,
                         name=dev["name"],
@@ -75,6 +76,18 @@ class AudioRecorder:
         except Exception as exc:
             print(f"[AudioRecorder] Error listing devices: {exc}")
         return default_api or devices
+
+    @staticmethod
+    def default_microphone_name() -> str:
+        """Name of the input device Windows currently uses by default. MME
+        calls it "Microsoft Sound Mapper": WASAPI knows the real device."""
+        try:
+            for api in sd.query_hostapis():
+                if "WASAPI" in api["name"] and api["default_input_device"] >= 0:
+                    return str(sd.query_devices(api["default_input_device"])["name"])
+            return str(sd.query_devices(kind="input")["name"])
+        except Exception:
+            return ""
 
     @staticmethod
     def find_microphone(name: str) -> Optional[int]:

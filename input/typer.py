@@ -82,3 +82,17 @@ class TextTyper:
                 print(f"[TextTyper] type error: {exc}")
                 return False
         return True
+
+    def backspace(self, count: int) -> None:
+        """Press Backspace `count` times (callers check the target window first)."""
+        if count <= 0:
+            return
+        with self._lock:
+            try:
+                from pynput.keyboard import Controller, Key
+                kb = Controller()
+                for _ in range(count):
+                    kb.press(Key.backspace)
+                    kb.release(Key.backspace)
+            except Exception as exc:
+                print(f"[TextTyper] backspace error: {exc}")

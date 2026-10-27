@@ -8,10 +8,12 @@ Transcriber: runs faster-whisper in a subprocess (stt/subprocess_worker.py).
   with a test transcription, so a native crash only costs that attempt.
 - One reader thread per worker feeds a queue. A request that times out kills
   the worker, so a late answer can never be paired with the next request.
+  Long recordings report progress, and the timeout counts from the last
+  sign of progress, so a 10-minute dictation is not cut off.
 - subprocess stderr is drained continuously so it never blocks.
 """
 from __future__ import annotations
-import base64, json, os, queue, subprocess, sys, threading, time
+import base64, json, os, queue, subprocess, sys, sysconfig, threading, time
 from pathlib import Path
 from typing import Callable, Optional
 import numpy as np
@@ -57,9 +59,32 @@ MODEL_INFO = {
 
 _LOAD_TIMEOUT       = 1800   # first use downloads the model (up to ~1.6 GB)
 _RESTART_TIMEOUT    = 300    # model already on disk
-_TRANSCRIBE_TIMEOUT = 60
+_IDLE_TIMEOUT       = 180    # longest wait for the next sign of progress
 _RETRY_BACKOFF      = 60     # after a failed restart, don't retry on every chunk
 _CREATE_NO_WINDOW   = 0x08000000
+_CUBLAS_DLL         = "cublas64_12.dll"
+
+
+def _transcribe_budget(seconds: float) -> float:
+    """Upper bound for one request: generous even for medium on a slow CPU."""
+    return 120.0 + 4.0 * seconds
+
+
+def _cpu_threads() -> int:
+    # Half the logical processors (≈ physical cores), at least 2, at most 8
+    return max(2, min(8, (os.cpu_count() or 4) // 2))
+
+
+def cublas_dir() -> Optional[Path]:
+    """Folder of cuBLAS for CUDA 12, if installed (Typra's optional NVIDIA
+    package, or a CUDA Toolkit on PATH)."""
+    pip_dir = Path(sysconfig.get_paths()["purelib"]) / "nvidia" / "cublas" / "bin"
+    if (pip_dir / _CUBLAS_DLL).exists():
+        return pip_dir
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry and (Path(entry) / _CUBLAS_DLL).exists():
+            return Path(entry)
+    return None
 
 
 class Transcriber:
@@ -72,7 +97,29 @@ class Transcriber:
         self._compute_type = "auto"
         self._closing      = False   # set by shutdown(): never start new workers
         self._retry_after  = 0.0
+        self._io_lock      = threading.Lock()   # dictation and the mic test share the worker
+        self._last_error   = ""
         self.worker_failed = False   # the worker could not be (re)started
+        self.gpu_problem   = ""      # why the GPU is not used, if it was requested
+        self.load_seconds  = 0.0
+        self.cpu_threads   = _cpu_threads()
+        # Called as on_event(level, message) for the Activity log (any thread)
+        self.on_event: Optional[Callable[[str, str], None]] = None
+
+    def _event(self, level: str, message: str) -> None:
+        print(f"[Transcriber] {message}")
+        if self.on_event:
+            try: self.on_event(level, message)
+            except Exception: pass
+
+    @property
+    def device_label(self) -> str:
+        """e.g. 'GPU (CUDA, float16)' or 'CPU (int8, 8 threads)'."""
+        if not self._loaded:
+            return "not loaded"
+        if self.gpu:
+            return f"GPU (CUDA, {self._compute_type})"
+        return f"CPU ({self._compute_type}, {self.cpu_threads} threads)"
 
     @staticmethod
     def faster_whisper_available() -> bool:
@@ -84,6 +131,7 @@ class Transcriber:
 
     @staticmethod
     def cuda_available() -> bool:
+        """An NVIDIA GPU and driver are present (cuBLAS may still be missing)."""
         try:
             import ctranslate2
             return ctranslate2.get_cuda_device_count() > 0
@@ -92,14 +140,19 @@ class Transcriber:
 
     def load(self, status_cb: Optional[Callable[[str], None]] = None) -> None:
         attempts = [("cpu", ct) for ct in ("auto", "float32", "int8")]
+        self.gpu_problem = ""
         if self.gpu:
-            if self.cuda_available():
-                attempts.insert(0, ("cuda", "float16"))
+            if not self.cuda_available():
+                self.gpu_problem = "no NVIDIA GPU with a CUDA driver was found"
+            elif cublas_dir() is None:
+                self.gpu_problem = ("the NVIDIA cuBLAS library is not installed "
+                                    "(Settings > Advanced > Install GPU support)")
             else:
-                print("[Transcriber] CUDA not available — using CPU")
+                attempts.insert(0, ("cuda", "float16"))
         if status_cb:
             status_cb(f"Loading '{self.model_size}' model "
                       f"({MODEL_INFO[self.model_size]['size']} download on first use)…")
+        started = time.monotonic()
         for device, compute_type in attempts:
             if self._closing:
                 raise RuntimeError("Typra is closing")
@@ -108,10 +161,16 @@ class Transcriber:
             if self._start(device, compute_type, _LOAD_TIMEOUT):
                 self.gpu, self._compute_type = device == "cuda", compute_type
                 self._loaded = True
-                print("[Transcriber] Worker ready.")
+                self.load_seconds = time.monotonic() - started
+                self._event("info", f"Model '{self.model_size}' ready on {self.device_label} "
+                                    f"in {self.load_seconds:.1f} s")
+                if self.gpu_problem:
+                    self._event("warning", f"GPU not used: {self.gpu_problem}")
                 if status_cb:
                     status_cb("Model ready — start speaking!")
                 return
+            if device == "cuda":
+                self.gpu_problem = self._last_error or "the GPU could not run the model"
         raise RuntimeError(f"Could not load the '{self.model_size}' Whisper model "
                            "with any device/compute type (see typra.log).")
 
@@ -129,10 +188,16 @@ class Transcriber:
         return self._loaded
 
     def transcribe(self, audio: np.ndarray, language: str = "en",
-                   initial_prompt: str = "") -> str:
+                   initial_prompt: str = "", best: bool = False,
+                   progress_cb: Optional[Callable[[float], None]] = None) -> str:
+        """best=True: beam search and VAD, for a whole recording (slower,
+        more accurate). progress_cb receives the fraction of audio done."""
         if not self._loaded or audio is None or len(audio) == 0:
             return ""
-        return self._subprocess_transcribe(audio, language, initial_prompt)
+        opts = {"language": language, "prompt": initial_prompt,
+                "beam_size": 5 if best else 1, "vad": best}
+        with self._io_lock:
+            return self._subprocess_transcribe(audio, opts, progress_cb)
 
     # ── Subprocess communication ──────────────────────────────────────
 
@@ -144,7 +209,8 @@ class Transcriber:
         info = MODEL_INFO[self.model_size]
         params = {"model": info["repo"], "revision": info["revision"],
                   "download_root": str(MODELS_DIR),
-                  "device": device, "compute_type": compute_type}
+                  "device": device, "compute_type": compute_type,
+                  "cpu_threads": self.cpu_threads}
         try:
             self._start_worker()
             if self._closing:   # shutdown() ran while the process was starting
@@ -158,10 +224,12 @@ class Transcriber:
         response = self._readline(timeout)
         if response != "READY":
             print(f"[Transcriber] Load failed ({device}/{compute_type}): {response}")
+            self._last_error = response[6:] if response.startswith("ERROR ") else response
             self._kill_worker()
             return False
         # Some compute types only crash at inference time
-        if self._do_transcribe(np.zeros(16000, dtype=np.float32), "en", "") is None:
+        if self._do_transcribe(np.zeros(16000, dtype=np.float32),
+                               {"language": "en", "beam_size": 1}) is None:
             print(f"[Transcriber] Test transcription failed ({device}/{compute_type})")
             self._kill_worker()
             return False
@@ -228,7 +296,7 @@ class Transcriber:
             return True
         if time.monotonic() < self._retry_after:
             return False
-        print("[Transcriber] Worker not running — restarting…")
+        self._event("warning", "The speech model process stopped: restarting it")
         device = "cuda" if self.gpu else "cpu"
         ok = self._start(device, self._compute_type, _RESTART_TIMEOUT)
         if not ok and (device, self._compute_type) != ("cpu", "float32") and \
@@ -237,41 +305,59 @@ class Transcriber:
             ok = True
         self.worker_failed = not ok
         if not ok:
+            self._event("error", "The speech model could not be restarted")
             self._retry_after = time.monotonic() + _RETRY_BACKOFF
         return ok
 
-    def _subprocess_transcribe(self, audio: np.ndarray,
-                                language: str, initial_prompt: str) -> str:
+    def _subprocess_transcribe(self, audio: np.ndarray, opts: dict,
+                                progress_cb: Optional[Callable[[float], None]]) -> str:
         if not self._ensure_worker():
             return ""
-        result = self._do_transcribe(audio, language, initial_prompt)
+        result = self._do_transcribe(audio, opts, progress_cb)
         # If GPU transcription errored, fall back to CPU and retry once
         if result is None and self.gpu:
-            print("[Transcriber] GPU transcription failed — falling back to CPU")
+            self._event("warning", f"GPU transcription failed ({self._last_error}): "
+                                   "switching to the CPU")
             if self._start("cpu", "float32", _RESTART_TIMEOUT):
                 self.gpu, self._compute_type = False, "float32"
-                result = self._do_transcribe(audio, language, initial_prompt)
+                result = self._do_transcribe(audio, opts, progress_cb)
         return result or ""
 
-    def _do_transcribe(self, audio: np.ndarray,
-                       language: str, initial_prompt: str) -> Optional[str]:
+    def _do_transcribe(self, audio: np.ndarray, opts: dict,
+                       progress_cb: Optional[Callable[[float], None]] = None) -> Optional[str]:
         """Send TRANSCRIBE, return text or None on error."""
-        if not language.isalpha():
-            language = "en"   # the protocol is space-separated
+        if not str(opts.get("language", "")).isalpha():
+            opts = {**opts, "language": "en"}
+        seconds = len(audio) / 16000
         try:
-            b64        = base64.b64encode(audio.astype(np.float32).tobytes()).decode("ascii")
-            prompt_b64 = base64.b64encode(initial_prompt.encode()).decode("ascii")
-            self._send(f"TRANSCRIBE {language} {prompt_b64} {b64}")
-            resp = self._readline(_TRANSCRIBE_TIMEOUT)
-            if resp.startswith("TEXT "):
-                return base64.b64decode(resp[5:]).decode("utf-8")
-            if resp == "EMPTY":
+            pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+            b64 = base64.b64encode(pcm.tobytes()).decode("ascii")
+            opts_b64 = base64.b64encode(json.dumps(opts).encode()).decode("ascii")
+            self._send(f"TRANSCRIBE {opts_b64} {b64}")
+            deadline = time.monotonic() + _transcribe_budget(seconds)
+            while True:
+                wait = min(_IDLE_TIMEOUT, max(1.0, deadline - time.monotonic()))
+                resp = self._readline(wait)
+                if resp.startswith("PROGRESS "):
+                    if progress_cb and seconds > 0:
+                        try: progress_cb(min(1.0, float(resp[9:]) / seconds))
+                        except ValueError: pass
+                    if time.monotonic() > deadline:
+                        print("[Transcriber] Transcription is taking too long — stopping worker")
+                        self._kill_worker()
+                        self._last_error = "timeout"
+                        return None
+                    continue
+                if resp.startswith("TEXT "):
+                    return base64.b64decode(resp[5:]).decode("utf-8")
+                if resp == "EMPTY":
+                    return ""
+                if resp.startswith("ERROR"):
+                    self._last_error = resp[6:]
+                    print(f"[Transcriber] Subprocess error: {resp[6:]}")
+                    return None   # signals "error occurred, consider fallback"
+                print(f"[Transcriber] Unexpected response: {resp[:100]}")
                 return ""
-            if resp.startswith("ERROR"):
-                print(f"[Transcriber] Subprocess error: {resp[6:]}")
-                return None   # signals "error occurred, consider fallback"
-            print(f"[Transcriber] Unexpected response: {resp[:100]}")
-            return ""
         except Exception as e:
             print(f"[Transcriber] _do_transcribe exception: {e}")
             self._kill_worker()

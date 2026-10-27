@@ -19,8 +19,11 @@ _MODEL_DIR = Path.home() / ".whisper_dictation" / "llm_models"
 _WORKER    = Path(__file__).with_name("llm_worker.py")
 
 _LOAD_TIMEOUT     = 300   # loading several GB from a slow disk
-_REQUEST_TIMEOUT  = 60
+_REQUEST_TIMEOUT  = 60    # plus time proportional to the text, see process()
 _LOAD_RETRY_AFTER = 300   # a model that failed to load is not retried on every phrase
+# Longest text sent for a rewrite: prompt + text + rewrite must fit the
+# worker's 4096-token context (about 3 characters per token)
+MAX_LLM_CHARS     = 4500
 _MIN_LLAMA_CPP    = (0, 2, 72)
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -219,15 +222,18 @@ class LLMProcessor:
 
     def process(self, text: str, tone: str = "cleanup",
                 use_gpu: bool = False) -> str:
-        if not text.strip() or tone == "none" or not self.is_ready():
+        if not text.strip() or tone == "none" or not self.is_ready() \
+                or len(text) > MAX_LLM_CHARS:
             return text
         system_prompt = _SYSTEM_PROMPTS.get(tone, _SYSTEM_PROMPTS["cleanup"]) + _GUARD
         with self._lock:
             if not self._ensure_worker(use_gpu):
                 return text
             reply = self._request({"system": system_prompt,
-                                   "text": f"<transcript>\n{text}\n</transcript>"},
-                                  _REQUEST_TIMEOUT)
+                                   "text": f"<transcript>\n{text}\n</transcript>",
+                                   # the rewrite is about as long as the text
+                                   "max_tokens": 128 + len(text) // 2},
+                                  _REQUEST_TIMEOUT + len(text) * 0.15)
         result = (reply or {}).get("text", "")
         return _sanitize(result, text) if result else text
 
