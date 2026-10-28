@@ -288,7 +288,7 @@ Typra keeps all of its data in `%USERPROFILE%\.whisper_dictation`:
 ## Building the installer
 
 1. Install [NSIS 3](https://nsis.sourceforge.io/Download).
-2. Run `installer\build.bat`, or `installer\build.bat 2.1.0` to set the version.
+2. Run `installer\build.bat`, or `installer\build.bat 2.1.1` to set the version.
 3. Publish the SHA-256 checksum that the script prints together with the `.exe`.
 
 To update dependencies, edit `requirements.txt` and regenerate the lock file with 64-bit Python 3.11 on Windows: `python tools\lock_requirements.py`. For GPU support, edit `requirements-gpu.txt` and run `python tools\lock_requirements.py --gpu`.
