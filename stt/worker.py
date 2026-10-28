@@ -20,6 +20,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from audio.recorder import AudioRecorder
 from config.settings import HALLUCINATION_PHRASES, Settings
+from stt.live_text import likely_continues_sentence
 from stt.transcriber import Transcriber
 from stt.voice_commands import process_commands, CommandResult
 
@@ -70,7 +71,7 @@ class TranscriptionWorker(QThread):
     """Each recording session has an id. start_transcribing() puts the new id
     into the audio queue as a marker, so audio captured before it is still
     processed for (and attributed to) the earlier session."""
-    text_ready      = pyqtSignal(str, int)   # text, session id
+    text_ready      = pyqtSignal(str, int, bool)  # text, session id, joins previous sentence
     command_delete  = pyqtSignal(int)        # session id
     status_changed  = pyqtSignal(str)        # listening | processing | recording | transcribing | idle
     session_done    = pyqtSignal(int)        # all audio of that session processed
@@ -94,6 +95,8 @@ class TranscriptionWorker(QThread):
         self._llm         = None
         self._llm_id      = None
         self._error_shown = False
+        self._last_live_text = ""
+        self._last_live_auto_period = False
 
     def start_transcribing(self, mode: str = "live") -> int:
         """Begin a new session (call before starting the recorder); returns its id."""
@@ -128,6 +131,8 @@ class TranscriptionWorker(QThread):
             next_session = None
             complete = self._modes.pop(session, "live") == "complete"
             self._context = ""
+            self._last_live_text = ""
+            self._last_live_auto_period = False
             self.status_changed.emit("recording" if complete else "listening")
             buf:        list[np.ndarray] = []
             buffered    = 0
@@ -273,12 +278,16 @@ class TranscriptionWorker(QThread):
             if result.delete_last:
                 self.event.emit("info", "Voice command: delete the last phrase")
                 self.command_delete.emit(session)
+                self._last_live_text = ""
+                self._last_live_auto_period = False
                 self.status_changed.emit(after); return
             text = result.text
+            is_voice_command = text != raw
             if text != raw:
                 self.event.emit("info", "Voice command recognised")
         else:
             text = raw
+            is_voice_command = False
 
         if not text:
             self.status_changed.emit(after); return
@@ -298,12 +307,35 @@ class TranscriptionWorker(QThread):
             self._llm = self._llm_id = None
 
         if text:
+            continues_previous = False
             if not complete:
-                self._context = (self._context + " " + text)[-_CONTEXT_CHARS * 2:]
+                if self._last_live_auto_period and not is_voice_command:
+                    decision = None
+                    if self._settings.llm_enabled and self._llm is not None:
+                        decision = self._llm.continues_sentence(self._last_live_text, text)
+                    continues_previous = (
+                        decision if decision is not None
+                        else likely_continues_sentence(
+                            self._last_live_text, text, self._settings.language)
+                    )
+
+                context = self._context.rstrip()
+                if continues_previous and context.endswith("."):
+                    context = context[:-1]
+                self._context = (context + " " + text)[-_CONTEXT_CHARS * 2:]
+                if continues_previous:
+                    self._last_live_text = (
+                        self._last_live_text.rstrip()[:-1] + " " + text
+                    )
+                else:
+                    self._last_live_text = text
+                self._last_live_auto_period = (
+                    not is_voice_command and text.rstrip().endswith(".")
+                )
             metrics["chars"] = len(text)
             print(f"[Worker] Emitting {len(text)} chars")
             self.transcribed.emit(session, metrics)
-            self.text_ready.emit(text, session)
+            self.text_ready.emit(text, session, continues_previous)
         self.status_changed.emit(after)
 
     def _apply_llm(self, text: str) -> str:

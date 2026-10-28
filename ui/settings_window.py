@@ -973,7 +973,9 @@ class SettingsWindow(QWidget):
             "letters follow the full context. Voice commands are not used."
             if complete else
             "Each phrase is typed when you pause, only into the window where you "
-            "started. If you switch window, the rest goes to the result panel.")
+            "started. A period at a pause may be removed if the next phrase "
+            "continues the same sentence. If you switch window, the rest goes "
+            "to the result panel.")
 
     def _on_model(self, _):
         m = self._model_combo.currentData()

@@ -27,6 +27,7 @@ from input.hotkey import DEFAULT_HOTKEY, HotkeyManager, is_safe_hotkey
 from input.typer import TextTyper
 from stt.transcriber import Transcriber
 from stt.voice_commands import command_spacing, ends_with_punct, join_phrases
+from stt.live_text import adjust_sentence_start, ends_sentence
 from stt.worker import COMPLETE_MAX_SECONDS, TranscriptionWorker
 from ui import winutil
 from ui.activity import ActivityLog
@@ -152,6 +153,8 @@ class AppController(QObject):
         self._last_sid    = 0      # session of _last_text
         self._last_trailing = False  # a space was typed after _last_text
         self._last_removed  = ""     # text _last_text replaced (". " before a spoken "?")
+        self._last_prefix_space = False
+        self._last_revision = None
         self._quitting    = False
         self._last_dark   = _is_dark()
 
@@ -426,6 +429,10 @@ class AppController(QObject):
                     f"on {self._transcriber.device_label}")
         self._panel.show_result(sid, text, session.target, info=info, reason=reason)
         self._last_text = ""
+        self._last_trailing = False
+        self._last_removed = ""
+        self._last_prefix_space = False
+        self._last_revision = None
         if reason:
             self._activity.warning(f"{len(text)} characters sent to the result panel: {reason}")
         else:
@@ -444,14 +451,13 @@ class AppController(QObject):
                     "dictation, so the text was kept here.")
         return ""
 
-    @pyqtSlot(str, int)
-    def _on_text_ready(self, text: str, sid: int) -> None:
+    @pyqtSlot(str, int, bool)
+    def _on_text_ready(self, text: str, sid: int, continues_previous: bool = False) -> None:
         if not text: return
         session = self._sessions.setdefault(sid, _Session(mode="live"))
-        # Accumulate in the session — saved to history when the session ends
-        session.buf.append(text)
 
         if session.mode == "complete":
+            session.buf.append(text)
             if self._settings.complete_output == "panel":
                 self._to_panel(session, sid, text)
                 session.outcome = "done|Text ready in the result panel"
@@ -473,18 +479,42 @@ class AppController(QObject):
         reason = "The rest of this dictation is collected here." if session.diverted \
             else self._blocked_reason(session)
         if reason:
+            session.buf.append(text)
             self._to_panel(session, sid, text, reason if not session.paneled else "")
             if self._recording and sid == self._session_id:
                 self._show_target(session)
             return
         fg = session.target
-        trailing = self._settings.add_trailing_space
+        previous = self._last_text if sid == self._last_sid else ""
+        revising_previous = (
+            continues_previous and previous.endswith(".") and fg == self._last_hwnd
+        )
+        if revising_previous:
+            text = adjust_sentence_start(
+                text, capitalize=False, language=self._settings.language)
+        elif previous and ends_sentence(previous):
+            text = adjust_sentence_start(
+                text, capitalize=True, language=self._settings.language)
+
+        trailing = self._settings.add_trailing_space or ends_sentence(text)
         removed = ""   # replaced by this command; "delete that" puts it back
+        revised_previous = ""
+        prefix_space = False
+        if revising_previous:
+            back = 1 + (1 if self._last_trailing else 0)
+            revised_previous = previous
+            removed = ". " if self._last_trailing else "."
+            self._typer.backspace(back)
+            prefix_space = True
+            session.typed = max(0, session.typed - 1)
+            if session.buf and session.buf[-1] == previous:
+                session.buf[-1] = previous[:-1]
+
         rule = command_spacing(text)
         if rule is not None:
             # A spoken "comma" or "new line" joins the previous phrase:
             # "Hello, " instead of "Hello , ", "Hello?" instead of "Hello.?"
-            trailing = trailing and rule.space_after
+            trailing = rule.space_after if rule.replaces_punct else trailing and rule.space_after
             if rule.attach and self._last_text and fg == self._last_hwnd \
                     and sid == self._last_sid:
                 back = 1 if self._last_trailing else 0
@@ -494,15 +524,23 @@ class AppController(QObject):
                     typed = self._last_text + (" " if self._last_trailing else "")
                     removed = typed[-back:]
                     self._typer.backspace(back)
-        if not self._typer.type_text(text, trailing_space=trailing, restore_focus=True):
+        typed_text = " " + text if prefix_space else text
+        if not self._typer.type_text(typed_text, trailing_space=trailing, restore_focus=True):
             if removed:
                 self._typer.type_text(removed, trailing_space=False)
+            if revised_previous and session.buf and session.buf[-1] == revised_previous[:-1]:
+                session.buf[-1] = revised_previous
+                session.typed += 1
+            session.buf.append(text)
             self._to_panel(session, sid, text, "Typing was skipped because keys were held down.")
             return
+        session.buf.append(text)
         session.typed += len(text)
         self._last_text, self._last_hwnd, self._last_sid = text, fg, sid
         self._last_trailing = trailing and not text.endswith(" ")
         self._last_removed = removed
+        self._last_prefix_space = prefix_space
+        self._last_revision = revised_previous or None
 
     @pyqtSlot(int)
     def _on_command_delete(self, sid: int) -> None:
@@ -516,6 +554,9 @@ class AppController(QObject):
         if not self._typer.wait_for_modifiers_release():
             print("[AppController] delete skipped: modifier keys held")
             self._last_text = ""
+            self._last_removed = ""
+            self._last_prefix_space = False
+            self._last_revision = None
             return
         if _foreground_window() != self._last_hwnd or _foreground_is_ours():
             print("[AppController] delete skipped: the foreground window changed")
@@ -523,16 +564,30 @@ class AppController(QObject):
             self._tray.showMessage("Typra", "\"Delete that\" was skipped: the window changed.",
                                    self._app_icon, 3000)
             self._last_text = ""
+            self._last_removed = ""
+            self._last_prefix_space = False
+            self._last_revision = None
             return
         session = self._sessions.get(sid)
         if session and session.buf and session.buf[-1] == self._last_text:
             session.buf.pop()   # keep deleted text out of the history
             session.typed = max(0, session.typed - len(self._last_text))
-        self._typer.backspace(len(self._last_text) + (1 if self._last_trailing else 0))
+        if self._last_revision and session and session.buf \
+                and session.buf[-1] == self._last_revision[:-1]:
+            session.buf[-1] = self._last_revision
+            session.typed += 1
+        self._typer.backspace(
+            len(self._last_text) + (1 if self._last_trailing else 0)
+            + (1 if self._last_prefix_space else 0)
+        )
         if self._last_removed:
             # Undo a spoken punctuation mark: restore what it replaced
             self._typer.type_text(self._last_removed, trailing_space=False)
         self._last_text = ""
+        self._last_trailing = False
+        self._last_removed = ""
+        self._last_prefix_space = False
+        self._last_revision = None
 
     @pyqtSlot(str, int)
     def _insert_from_panel(self, text: str, hwnd: int) -> None:

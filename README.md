@@ -94,6 +94,11 @@ Choose the mode in **Settings → Transcription**, or from the tray menu (**Dict
 | Voice commands | Yes | No |
 | Where the text goes | Typed into the window where you started | The result panel, or typed into the window where you started (your choice) |
 
+In live mode, a period placed at a pause can be removed when the next phrase
+continues the same sentence. AI Cleanup helps decide when enabled; otherwise,
+Typra uses a language-aware fallback. A new sentence after a period, question
+mark or exclamation mark starts with a capital letter.
+
 In whole-text mode the bottom panel shows a timer while you speak, then the transcription progress.
 
 ### Where the text goes
