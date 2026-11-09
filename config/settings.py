@@ -146,7 +146,8 @@ class Settings:
     @property
     def silence_threshold(self) -> float: return float(self._data["silence_threshold"])
     @property
-    def silence_seconds(self) -> float:   return float(self._data["silence_seconds"])
+    def silence_seconds(self) -> float:
+        return min(3.0, max(0.3, float(self._data["silence_seconds"])))
     @property
     def add_trailing_space(self) -> bool: return bool(self._data["add_trailing_space"])
     @property

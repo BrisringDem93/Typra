@@ -20,7 +20,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from audio.recorder import AudioRecorder
 from config.settings import HALLUCINATION_PHRASES, Settings
-from stt.live_text import likely_continues_sentence
+from stt.live_text import fix_common_mistakes, likely_continues_sentence
 from stt.transcriber import Transcriber
 from stt.voice_commands import process_commands, CommandResult
 
@@ -307,6 +307,7 @@ class TranscriptionWorker(QThread):
             self._llm = self._llm_id = None
 
         if text:
+            text = fix_common_mistakes(text, self._settings.language)
             continues_previous = False
             if not complete:
                 if self._last_live_auto_period and not is_voice_command:

@@ -99,3 +99,29 @@ def continuation_separator(previous: str, language: str) -> str:
     if language == "it" and previous.strip().casefold() in {"oh.", "ah.", "eh."}:
         return ", "
     return " "
+
+
+# "apposto" is only right as the participle of "apporre" (ho apposto la firma,
+# viene apposto il timbro): after any other word it is a mishearing of "a posto"
+_APPOSTO = re.compile(r"\b([Aa])pposto\b")
+_APPORRE_AUXILIARIES = {
+    "ho", "hai", "ha", "abbiamo", "avete", "hanno", "avevo", "avevi", "aveva",
+    "avevamo", "avevate", "avevano", "avrò", "avrai", "avrà", "avremo", "avrete",
+    "avranno", "avrei", "avresti", "avrebbe", "avremmo", "avreste", "avrebbero",
+    "abbia", "abbiano", "avessi", "avesse", "avessero", "avere", "aver", "avendo",
+    "stato", "viene", "vengono", "venne", "verrà", "venga", "vengano", "veniva",
+}
+
+
+def fix_common_mistakes(text: str, language: str) -> str:
+    """Correct frequent mishearings that Whisper and the cleanup model keep."""
+    if language != "it":
+        return text
+
+    def _replace(match: re.Match) -> str:
+        before = re.findall(r"\w+", text[:match.start()].casefold())
+        if before and before[-1] in _APPORRE_AUXILIARIES:
+            return match.group()
+        return match.group(1) + " posto"
+
+    return _APPOSTO.sub(_replace, text)

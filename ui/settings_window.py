@@ -379,6 +379,21 @@ class SettingsWindow(QWidget):
         self._output_combo.currentIndexChanged.connect(
             lambda _: self._settings.set("complete_output", self._output_combo.currentData()))
         v.addWidget(self._output_combo)
+        self._pause_lbl = self._hint("Pause that ends a phrase:")
+        v.addWidget(self._pause_lbl)
+        self._pause_combo = QComboBox()
+        pauses = [(0.5, "fast, may cut sentences"), (0.7, "default"),
+                  (1.0, ""), (1.3, ""), (1.6, ""), (2.0, "slow, fewer cuts")]
+        cur_pause = self._settings.silence_seconds
+        if all(abs(s - cur_pause) > 0.01 for s, _ in pauses):
+            pauses = sorted(pauses + [(cur_pause, "")])
+        for secs, note in pauses:
+            self._pause_combo.addItem(f"{secs:.1f} s" + (f"  ({note})" if note else ""), secs)
+            if abs(secs - cur_pause) < 0.01:
+                self._pause_combo.setCurrentIndex(self._pause_combo.count() - 1)
+        self._pause_combo.currentIndexChanged.connect(
+            lambda _: self._settings.set("silence_seconds", self._pause_combo.currentData()))
+        v.addWidget(self._pause_combo)
         self._update_mode_hint()
 
         v.addWidget(self._div())
@@ -967,6 +982,8 @@ class SettingsWindow(QWidget):
     def _update_mode_hint(self) -> None:
         complete = self._mode_combo.currentData() == "complete"
         self._output_combo.setVisible(complete)
+        self._pause_lbl.setVisible(not complete)
+        self._pause_combo.setVisible(not complete)
         self._mode_hint.setText(
             "Speak freely, pauses included, up to 10 minutes. When you stop, the "
             "whole recording is transcribed at once, so punctuation and capital "
