@@ -22,6 +22,9 @@ DEFAULTS: dict = {
     "live_max_seconds":   12.0,          # longest phrase in live mode
     "silence_threshold":  0.008,
     "silence_seconds":    0.7,
+    # live: if speech resumes within this many seconds, the previous phrase
+    # is transcribed again together with the new one and corrected (0: off)
+    "live_rejoin_seconds": 4.0,
     "sample_rate":        16000,
     "add_trailing_space": True,
     "filter_hallucinations": True,
@@ -148,6 +151,9 @@ class Settings:
     @property
     def silence_seconds(self) -> float:
         return min(3.0, max(0.3, float(self._data["silence_seconds"])))
+    @property
+    def live_rejoin_seconds(self) -> float:
+        return min(10.0, max(0.0, float(self._data["live_rejoin_seconds"])))
     @property
     def add_trailing_space(self) -> bool: return bool(self._data["add_trailing_space"])
     @property

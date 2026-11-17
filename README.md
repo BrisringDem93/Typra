@@ -99,6 +99,16 @@ continues the same sentence. AI Cleanup helps decide when enabled; otherwise,
 Typra uses a language-aware fallback. A new sentence after a period, question
 mark or exclamation mark starts with a capital letter.
 
+If you resume speaking within a few seconds (4 by default, set in **Settings →
+Transcription**), Typra transcribes the previous phrase again together with
+the new one. Whisper then hears the whole sentence, so a period put at the
+pause, or a word misheard without the rest of the sentence, is corrected on
+screen. Only the characters that change are erased and typed again. To keep
+your own edits safe, the correction is skipped if you typed or clicked since
+the previous phrase, and it never erases a line break. In that case only the
+new words are added. "Delete that" after a correction brings back the
+previous phrase as it was typed before the correction.
+
 In whole-text mode the bottom panel shows a timer while you speak, then the transcription progress.
 
 ### Where the text goes

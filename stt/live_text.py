@@ -1,6 +1,7 @@
 """Small language-aware corrections for live dictation segments."""
 from __future__ import annotations
 
+import difflib
 import re
 
 
@@ -21,8 +22,8 @@ _CONTINUATION_WORDS = {
 _CONTINUATION_STARTERS = {
     "en": {"and", "but", "because", "that", "which", "so", "or", "if", "when",
            "to", "of", "for", "with", "from", "in", "on", "as", "while"},
-    "it": {"e", "ma", "perché", "che", "quindi", "oppure", "se", "quando",
-           "però", "allora", "invece", "poi", "di", "da", "in", "a", "ad",
+    "it": {"e", "ed", "o", "ma", "perché", "che", "quindi", "oppure", "se", "quando",
+           "però", "allora", "invece", "poi", "cioè", "di", "da", "in", "a", "ad",
            "per", "con", "su", "tra", "fra", "come", "mentre", "finché"},
     "de": {"und", "aber", "weil", "dass", "also", "oder", "wenn", "zu", "von",
            "für", "mit", "in", "auf", "während"},
@@ -88,6 +89,30 @@ def adjust_sentence_start(text: str, *, capitalize: bool, language: str) -> str:
             replacement = char.lower()
         return text[:index] + replacement + text[index + 1:]
     return text
+
+
+def new_part(previous: str, combined: str) -> str:
+    """The end of `combined` (previous phrase and new one transcribed together)
+    that was not in `previous`, for when the previous phrase cannot be corrected
+    on screen. Words are matched loosely: punctuation and case may differ."""
+    words = list(re.finditer(r"\w+", combined))
+    old = [w.casefold() for w in re.findall(r"\w+", previous)]
+    new = [w.group().casefold() for w in words]
+    if not old:
+        return combined.strip()
+    matcher = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
+    end = 0   # words of `combined` that belong to the previous phrase
+    for block in matcher.get_matching_blocks():
+        if block.size:
+            end = block.b + block.size
+    if end >= len(words):
+        return ""
+    if end == 0:
+        return combined.strip()
+    # From the end of the last word of the previous phrase, skipping the
+    # punctuation and spaces that separated the two phrases
+    rest = combined[words[end - 1].end():]
+    return re.sub(r"^[\s.,;:!?…]+", "", rest).strip()
 
 
 def ends_sentence(text: str) -> bool:

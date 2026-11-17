@@ -50,6 +50,16 @@ class TextTyper:
             time.sleep(0.02)
         return True
 
+    @staticmethod
+    def prepare(text: str, trailing_space: bool) -> str:
+        """The characters type_text() sends for `text`."""
+        # Control characters would be sent as real keys (Backspace, Esc...)
+        text = "".join(c for c in text
+                       if c in "\n\t" or not unicodedata.category(c).startswith("C"))
+        if not text:
+            return ""
+        return text + (" " if trailing_space and not text.endswith(" ") else "")
+
     def type_text(
         self,
         text: str,
@@ -57,12 +67,9 @@ class TextTyper:
         restore_focus: bool = True,
     ) -> bool:
         """Type `text`; returns False if it was not typed."""
-        # Control characters would be sent as real keys (Backspace, Esc...)
-        text = "".join(c for c in text
-                       if c in "\n\t" or not unicodedata.category(c).startswith("C"))
-        if not text:
+        full = self.prepare(text, trailing_space)
+        if not full:
             return True
-        full = text + (" " if trailing_space and not text.endswith(" ") else "")
         if not self.wait_for_modifiers_release():
             print("[TextTyper] modifier keys still held — not typing")
             return False
@@ -96,3 +103,32 @@ class TextTyper:
                     kb.release(Key.backspace)
             except Exception as exc:
                 print(f"[TextTyper] backspace error: {exc}")
+
+
+class MirroredTyper:
+    """Types through `typer` (None: only simulates) and keeps a copy of the
+    text it produced, so a later correction knows exactly what is on screen."""
+
+    def __init__(self, typer: TextTyper | None, text: str = "") -> None:
+        self._typer = typer
+        self.text = text
+
+    @staticmethod
+    def wait_for_modifiers_release(timeout: float = 2.0) -> bool:
+        return TextTyper.wait_for_modifiers_release(timeout)
+
+    def type_text(self, text: str, trailing_space: bool = True,
+                  restore_focus: bool = True) -> bool:
+        full = TextTyper.prepare(text, trailing_space)
+        if self._typer is not None and not self._typer.type_text(
+                text, trailing_space=trailing_space, restore_focus=restore_focus):
+            return False
+        self.text += full
+        return True
+
+    def backspace(self, count: int) -> None:
+        if count <= 0:
+            return
+        if self._typer is not None:
+            self._typer.backspace(count)
+        self.text = self.text[:max(0, len(self.text) - count)]

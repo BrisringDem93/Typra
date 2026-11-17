@@ -394,6 +394,23 @@ class SettingsWindow(QWidget):
         self._pause_combo.currentIndexChanged.connect(
             lambda _: self._settings.set("silence_seconds", self._pause_combo.currentData()))
         v.addWidget(self._pause_combo)
+        self._rejoin_lbl = self._hint(
+            "If you resume speaking within this time, the previous phrase is read "
+            "again with the new one and corrected (punctuation, misheard words):")
+        v.addWidget(self._rejoin_lbl)
+        self._rejoin_combo = QComboBox()
+        rejoins = [(0.0, "off"), (2.0, ""), (3.0, ""), (4.0, "default"), (6.0, ""), (8.0, "")]
+        cur_rejoin = self._settings.live_rejoin_seconds
+        if all(abs(s - cur_rejoin) > 0.01 for s, _ in rejoins):
+            rejoins = sorted(rejoins + [(cur_rejoin, "")])
+        for secs, note in rejoins:
+            label = "Off" if secs == 0 else f"{secs:.0f} s" + (f"  ({note})" if note else "")
+            self._rejoin_combo.addItem(label, secs)
+            if abs(secs - cur_rejoin) < 0.01:
+                self._rejoin_combo.setCurrentIndex(self._rejoin_combo.count() - 1)
+        self._rejoin_combo.currentIndexChanged.connect(
+            lambda _: self._settings.set("live_rejoin_seconds", self._rejoin_combo.currentData()))
+        v.addWidget(self._rejoin_combo)
         self._update_mode_hint()
 
         v.addWidget(self._div())
@@ -984,6 +1001,8 @@ class SettingsWindow(QWidget):
         self._output_combo.setVisible(complete)
         self._pause_lbl.setVisible(not complete)
         self._pause_combo.setVisible(not complete)
+        self._rejoin_lbl.setVisible(not complete)
+        self._rejoin_combo.setVisible(not complete)
         self._mode_hint.setText(
             "Speak freely, pauses included, up to 10 minutes. When you stop, the "
             "whole recording is transcribed at once, so punctuation and capital "

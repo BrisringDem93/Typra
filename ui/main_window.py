@@ -24,11 +24,12 @@ from audio.recorder import AudioRecorder
 from config.settings import Settings
 from db.history import HistoryStore
 from input.hotkey import DEFAULT_HOTKEY, HotkeyManager, is_safe_hotkey
-from input.typer import TextTyper
+from input.typer import MirroredTyper, TextTyper
+from input.user_input import UserInputWatch
 from stt.transcriber import Transcriber
 from stt.voice_commands import command_spacing, ends_with_punct, join_phrases
 from stt.live_text import adjust_sentence_start, continuation_separator, ends_sentence
-from stt.worker import COMPLETE_MAX_SECONDS, TranscriptionWorker
+from stt.worker import COMPLETE_MAX_SECONDS, LiveText, TranscriptionWorker
 from ui import winutil
 from ui.activity import ActivityLog
 from ui.clipboard import copy_private
@@ -88,6 +89,40 @@ class _Session:
     paneled:  int  = 0         # characters sent to the result panel
     diverted: bool = False     # live: the rest of the session goes to the panel
     outcome:  str  = ""        # final message for the overlay
+
+
+@dataclass
+class _LiveState:
+    """What the live typing state was at some point, to go back to it."""
+    last_text: str
+    last_hwnd: int
+    last_sid: int
+    last_trailing: bool
+    last_removed: str
+    last_prefix_len: int
+    last_revision: object
+    buf: list
+    typed: int
+    screen: str           # text typed so far into the window in this session
+
+
+@dataclass
+class _PhraseRecord:
+    """The last live phrase typed: the worker may send it again, corrected."""
+    seg: int
+    sid: int
+    hwnd: int
+    before: _LiveState    # state just before the phrase was typed
+    input_mark: int       # user keys and clicks counted when it was typed
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 def make_app_icon() -> QIcon:
@@ -155,6 +190,13 @@ class AppController(QObject):
         self._last_removed  = ""     # text _last_text replaced (". " before a spoken "?")
         self._last_prefix_len = 0
         self._last_revision = None
+        # Live: copy of the text typed into the target, and the last phrase,
+        # so a phrase transcribed again after a short pause can be corrected
+        self._screen: MirroredTyper | None = None
+        self._screen_key = (0, 0)  # session, window of _screen
+        self._phrase: _PhraseRecord | None = None
+        self._undo_state: _LiveState | None = None  # before the last correction
+        self._input_watch = UserInputWatch()
         self._quitting    = False
         self._last_dark   = _is_dark()
 
@@ -326,6 +368,8 @@ class AppController(QObject):
         self._overlay.show_overlay()
         self._tray.update_recording_state(True)
         self._watch.start()
+        if mode == "live" and target and self._settings.live_rejoin_seconds > 0:
+            self._input_watch.start()
         where = session.target_desc or "the result panel (no window was in front)"
         self._activity.info(f"Dictation started ({'whole text' if mode == 'complete' else 'live'}) → {where}")
 
@@ -387,6 +431,7 @@ class AppController(QObject):
                                                       else "no speech recognised"))
         if self._recording:
             return   # a new dictation is already on screen
+        self._input_watch.stop()
         if session.outcome:
             status, text = session.outcome.split("|", 1)
         elif not session.buf:
@@ -433,6 +478,8 @@ class AppController(QObject):
         self._last_removed = ""
         self._last_prefix_len = 0
         self._last_revision = None
+        self._phrase = None
+        self._undo_state = None
         if reason:
             self._activity.warning(f"{len(text)} characters sent to the result panel: {reason}")
         else:
@@ -451,8 +498,9 @@ class AppController(QObject):
                     "dictation, so the text was kept here.")
         return ""
 
-    @pyqtSlot(str, int, bool)
-    def _on_text_ready(self, text: str, sid: int, continues_previous: bool = False) -> None:
+    @pyqtSlot(object)
+    def _on_text_ready(self, item: LiveText) -> None:
+        text, sid = item.text, item.session
         if not text: return
         session = self._sessions.setdefault(sid, _Session(mode="live"))
 
@@ -467,6 +515,7 @@ class AppController(QObject):
                 self._to_panel(session, sid, text, reason)
                 session.outcome = "warning|The window changed: text is in the result panel"
                 return
+            self._forget_live_typing()
             if self._typer.type_text(text, trailing_space=self._settings.add_trailing_space,
                                      restore_focus=True):
                 session.typed += len(text)
@@ -474,6 +523,20 @@ class AppController(QObject):
             else:
                 self._to_panel(session, sid, text, "Typing was skipped because keys were held down.")
             return
+
+        continues_previous = item.joins
+        replaceable = True
+        if item.replaces:
+            # The previous phrase transcribed again together with this one
+            if self._replace_phrase(session, sid, item):
+                return
+            # It cannot be corrected on screen: add only the new words. What
+            # is on screen no longer matches the worker's phrase: it is never
+            # corrected later either.
+            text, continues_previous, replaceable = item.tail, False, False
+            self._phrase = None
+            if not text:
+                return
 
         # Live: once text went to the panel, the rest of the session follows it
         reason = "The rest of this dictation is collected here." if session.diverted \
@@ -485,6 +548,92 @@ class AppController(QObject):
                 self._show_target(session)
             return
         fg = session.target
+        before = self._live_state(session)
+        if self._type_live(session, sid, fg, text, continues_previous, self._live_typer(sid, fg)):
+            self._phrase = _PhraseRecord(item.seg, sid, fg, before, self._input_watch.count) \
+                if replaceable else None
+            self._undo_state = None
+
+    def _live_typer(self, sid: int, hwnd: int) -> MirroredTyper:
+        """Types into the target window and remembers what was typed there."""
+        if self._screen is None or self._screen_key != (sid, hwnd):
+            self._screen = MirroredTyper(self._typer)
+            self._screen_key = (sid, hwnd)
+        return self._screen
+
+    def _forget_live_typing(self) -> None:
+        """Text was typed outside live dictation: earlier phrases are not corrected."""
+        self._screen = None
+        self._screen_key = (0, 0)
+        self._phrase = None
+        self._undo_state = None
+
+    def _live_state(self, session: _Session) -> _LiveState:
+        return _LiveState(
+            self._last_text, self._last_hwnd, self._last_sid, self._last_trailing,
+            self._last_removed, self._last_prefix_len, self._last_revision,
+            list(session.buf), session.typed, self._screen.text if self._screen else "")
+
+    def _restore_live_state(self, session: _Session, state: _LiveState) -> None:
+        """Typing state only: the caller makes the screen match state.screen."""
+        self._last_text, self._last_hwnd, self._last_sid = \
+            state.last_text, state.last_hwnd, state.last_sid
+        self._last_trailing, self._last_removed = state.last_trailing, state.last_removed
+        self._last_prefix_len, self._last_revision = state.last_prefix_len, state.last_revision
+        session.buf[:] = state.buf
+        session.typed = state.typed
+
+    def _rewrite_screen(self, target: str) -> bool:
+        """Change the text typed in this session into `target`, with the fewest
+        keys: backspace to where the two differ, then type the rest."""
+        screen = self._screen
+        keep = _common_prefix_len(screen.text, target)
+        if not self._typer.wait_for_modifiers_release():
+            return False
+        screen.backspace(len(screen.text) - keep)
+        return screen.type_text(target[keep:], trailing_space=False)
+
+    def _replace_phrase(self, session: _Session, sid: int, item: LiveText) -> bool:
+        """Put `item` (the previous phrase and a new one, transcribed together)
+        in place of the previous phrase. False if that is not safe: the text
+        then goes on as usual."""
+        rec = self._phrase
+        if rec is None or rec.seg != item.replaces or rec.sid != sid or session.diverted \
+                or self._screen is None or self._screen_key != (sid, rec.hwnd):
+            return False
+        if not self._input_watch.active or self._input_watch.count != rec.input_mark:
+            print("[AppController] previous phrase not corrected: user input since it was typed")
+            return False
+        if self._blocked_reason(session):
+            return False
+        current = self._live_state(session)
+        # What typing the joined text right after the earlier phrases gives
+        self._restore_live_state(session, rec.before)
+        simulated = MirroredTyper(None, rec.before.screen)
+        self._type_live(session, sid, rec.hwnd, item.text, item.joins, simulated)
+        keep = _common_prefix_len(current.screen, simulated.text)
+        erased = current.screen[keep:]
+        if "\n" in erased or "\t" in erased:
+            # Enter may have sent a message, Tab moved the focus: never undo them
+            self._restore_live_state(session, current)
+            return False
+        if not self._rewrite_screen(simulated.text):
+            self._restore_live_state(session, current)
+            self._activity.warning("A phrase could not be corrected because keys were held down")
+            self._forget_live_typing()
+            return False
+        self._phrase = _PhraseRecord(item.seg, sid, rec.hwnd, rec.before,
+                                     self._input_watch.count)
+        self._undo_state = current
+        print(f"[AppController] previous phrase rewritten: {len(erased)} characters erased")
+        if keep < len(current.screen):
+            self._activity.info("Previous phrase corrected after a short pause")
+        return True
+
+    def _type_live(self, session: _Session, sid: int, fg: int, text: str,
+                   continues_previous: bool, typer) -> bool:
+        """Type a live phrase after the ones before it (punctuation and
+        capitals joined to them); False if it went to the result panel."""
         previous = self._last_text if sid == self._last_sid else ""
         revising_previous = (
             continues_previous and previous.endswith(".") and fg == self._last_hwnd
@@ -504,7 +653,7 @@ class AppController(QObject):
             back = 1 + (1 if self._last_trailing else 0)
             revised_previous = previous
             removed = ". " if self._last_trailing else "."
-            self._typer.backspace(back)
+            typer.backspace(back)
             prefix = continuation_separator(previous, self._settings.language)
             session.typed = max(0, session.typed - 1)
             if session.buf and session.buf[-1] == previous:
@@ -523,17 +672,17 @@ class AppController(QObject):
                 if back:
                     typed = self._last_text + (" " if self._last_trailing else "")
                     removed = typed[-back:]
-                    self._typer.backspace(back)
+                    typer.backspace(back)
         typed_text = prefix + text
-        if not self._typer.type_text(typed_text, trailing_space=trailing, restore_focus=True):
+        if not typer.type_text(typed_text, trailing_space=trailing, restore_focus=True):
             if removed:
-                self._typer.type_text(removed, trailing_space=False)
+                typer.type_text(removed, trailing_space=False)
             if revised_previous and session.buf and session.buf[-1] == revised_previous[:-1]:
                 session.buf[-1] = revised_previous
                 session.typed += 1
             session.buf.append(text)
             self._to_panel(session, sid, text, "Typing was skipped because keys were held down.")
-            return
+            return False
         session.buf.append(text)
         session.typed += len(text) + max(0, len(prefix) - 1)
         self._last_text, self._last_hwnd, self._last_sid = text, fg, sid
@@ -541,6 +690,7 @@ class AppController(QObject):
         self._last_removed = removed
         self._last_prefix_len = len(prefix)
         self._last_revision = revised_previous or None
+        return True
 
     @pyqtSlot(int)
     def _on_command_delete(self, sid: int) -> None:
@@ -569,6 +719,20 @@ class AppController(QObject):
             self._last_revision = None
             return
         session = self._sessions.get(sid)
+        if self._undo_state is not None and session is not None and self._screen is not None \
+                and self._screen_key == (sid, self._last_hwnd):
+            # The last phrase corrected the one before it: go back to that one
+            # as it was typed
+            state, self._undo_state, self._phrase = self._undo_state, None, None
+            if self._rewrite_screen(state.screen):
+                self._restore_live_state(session, state)
+            else:
+                self._activity.warning("\"Delete that\" was skipped: keys were held down")
+                self._forget_live_typing()
+            return
+        self._phrase = None
+        self._undo_state = None
+        typer = self._live_typer(sid, self._last_hwnd)
         if session and session.buf and session.buf[-1] == self._last_text:
             session.buf.pop()   # keep deleted text out of the history
             session.typed = max(0, session.typed - len(self._last_text))
@@ -576,13 +740,13 @@ class AppController(QObject):
                 and session.buf[-1] == self._last_revision[:-1]:
             session.buf[-1] = self._last_revision
             session.typed += 1
-        self._typer.backspace(
+        typer.backspace(
             len(self._last_text) + (1 if self._last_trailing else 0)
             + self._last_prefix_len
         )
         if self._last_removed:
             # Undo a spoken punctuation mark: restore what it replaced
-            self._typer.type_text(self._last_removed, trailing_space=False)
+            typer.type_text(self._last_removed, trailing_space=False)
         self._last_text = ""
         self._last_trailing = False
         self._last_removed = ""
@@ -604,6 +768,7 @@ class AppController(QObject):
                                    "should go, then use Copy and Ctrl+V.")
             self._activity.warning(f"Insert into {app} failed: the window could not be activated")
             return
+        self._forget_live_typing()
         if self._typer.type_text(text, trailing_space=False, restore_focus=True):
             self._activity.info(f"Inserted {len(text)} characters into {app}")
             self._overlay.set_target("")
@@ -619,6 +784,7 @@ class AppController(QObject):
             # Never type into Typra's own windows
             self._copy_instead(text, "Click where the text should go and press Ctrl+V.")
             return
+        self._forget_live_typing()
         if not self._typer.type_text(text, trailing_space=True, restore_focus=True):
             self._copy_instead(text, "Typing was skipped because keys were held down.")
 
@@ -849,6 +1015,7 @@ class AppController(QObject):
             lambda: self._model_loader.wait(5000),
             lambda: self._hotkey.stop(),
             lambda: self._typer.stop_tracking(),
+            lambda: self._input_watch.stop(),
             lambda: self._theme_timer.stop(),
             lambda: self._settings_win.hide(),
             lambda: self._panel.hide(),
