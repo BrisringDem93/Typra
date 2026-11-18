@@ -26,7 +26,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from audio.recorder import AudioRecorder
 from config.settings import HALLUCINATION_PHRASES, Settings
-from stt.live_text import fix_common_mistakes, likely_continues_sentence, new_part
+from stt.live_text import (collapse_loops, fix_common_mistakes, has_loop,
+                           likely_continues_sentence, new_part)
 from stt.transcriber import Transcriber
 from stt.voice_commands import process_commands, CommandResult
 
@@ -41,8 +42,11 @@ COMPLETE_MAX_SECONDS = 600
 # Text of the session given to Whisper as context in live mode
 _CONTEXT_CHARS = 200
 # Longest audio transcribed again when the previous phrase is joined to the
-# new one (Whisper reads 30 s at a time)
-_REJOIN_MAX_SECONDS = 28.0
+# new one. Longer joins make Whisper loop more often and rewrite more text;
+# past this length the new phrase starts on its own.
+_REJOIN_MAX_SECONDS = 16.0
+# More text than anyone speaks: a joined transcription this dense is a loop
+_MAX_CHARS_PER_SECOND = 30
 # Speech this short may be a voice command: it is first transcribed alone,
 # since commands are only recognised when they are the whole phrase
 _COMMAND_MAX_SPEECH_SECONDS = 2.5
@@ -333,7 +337,15 @@ class TranscriptionWorker(QThread):
             print(f"[Worker] Pause of {pause_s:.1f}s: transcribing the previous phrase again "
                   f"with this one ({(len(prev.audio) + len(audio)) / sr:.1f}s)")
             context = prev.context[-_CONTEXT_CHARS:]
+            joined_s = (len(prev.audio) + len(audio)) / sr
             raw = self._transcribe(np.concatenate([prev.audio, audio]), session, False, context)
+            if has_loop(raw) or len(raw) > joined_s * _MAX_CHARS_PER_SECOND:
+                # Whisper looped on the joined audio: keep the previous phrase
+                # as typed and transcribe only the new one
+                print("[Worker] Joined transcription looped: using the new phrase alone")
+                prev = None
+                context = self._context[-_CONTEXT_CHARS:]
+                raw = self._transcribe(audio, session, False, context)
         elif raw is None:
             raw = self._transcribe(audio, session, complete, context)
         stt_s = time.monotonic() - started
@@ -357,6 +369,9 @@ class TranscriptionWorker(QThread):
                 self.status_changed.emit(after); return
 
         raw = _clean(raw, complete)
+        if not complete and has_loop(raw):
+            print("[Worker] Repeated words removed from a looping transcription")
+            raw = collapse_loops(raw)
 
         if self._settings.voice_commands_enabled and not complete and prev is None:
             result: CommandResult = process_commands(raw, language)

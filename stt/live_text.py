@@ -115,6 +115,21 @@ def new_part(previous: str, combined: str) -> str:
     return re.sub(r"^[\s.,;:!?…]+", "", rest).strip()
 
 
+# The same 1-6 words, four or more times in a row: Whisper stuck in a loop
+_LOOP = re.compile(r"\b(\w+(?:\W+\w+){0,5}?)(?:\W+\1\b){3,}", re.IGNORECASE)
+
+
+def has_loop(text: str) -> bool:
+    """Whisper repeating the same words over and over ("con una tabella con
+    una tabella ..."), which it does on some audio instead of transcribing it."""
+    return bool(_LOOP.search(text))
+
+
+def collapse_loops(text: str) -> str:
+    """Keep one copy of words repeated in a loop."""
+    return _LOOP.sub(lambda m: m.group(1), text)
+
+
 def ends_sentence(text: str) -> bool:
     text = text.rstrip()
     return bool(text) and text[-1] in ".?!。？！؟"

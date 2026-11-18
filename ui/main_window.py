@@ -116,6 +116,10 @@ class _PhraseRecord:
     input_mark: int       # user keys and clicks counted when it was typed
 
 
+# A correction never erases more than this many characters
+_MAX_ERASED = 150
+
+
 def _common_prefix_len(a: str, b: str) -> int:
     n = 0
     for x, y in zip(a, b):
@@ -368,6 +372,7 @@ class AppController(QObject):
         self._overlay.show_overlay()
         self._tray.update_recording_state(True)
         self._watch.start()
+        self._forget_live_typing()   # nothing typed before this dictation is touched
         if mode == "live" and target and self._settings.live_rejoin_seconds > 0:
             self._input_watch.start()
         where = session.target_desc or "the result panel (no window was in front)"
@@ -548,8 +553,11 @@ class AppController(QObject):
                 self._show_target(session)
             return
         fg = session.target
+        # First, so the state below holds this session's text, not the copy
+        # kept for an earlier dictation
+        typer = self._live_typer(sid, fg)
         before = self._live_state(session)
-        if self._type_live(session, sid, fg, text, continues_previous, self._live_typer(sid, fg)):
+        if self._type_live(session, sid, fg, text, continues_previous, typer):
             self._phrase = _PhraseRecord(item.seg, sid, fg, before, self._input_watch.count) \
                 if replaceable else None
             self._undo_state = None
@@ -615,6 +623,12 @@ class AppController(QObject):
         erased = current.screen[keep:]
         if "\n" in erased or "\t" in erased:
             # Enter may have sent a message, Tab moved the focus: never undo them
+            self._restore_live_state(session, current)
+            return False
+        if len(erased) > _MAX_ERASED:
+            # Whisper changed the start of a long phrase: not worth retyping it all
+            print(f"[AppController] previous phrase not corrected: {len(erased)} "
+                  "characters would be erased")
             self._restore_live_state(session, current)
             return False
         if not self._rewrite_screen(simulated.text):
